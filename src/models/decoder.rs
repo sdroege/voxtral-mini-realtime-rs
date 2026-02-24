@@ -197,9 +197,9 @@ impl<B: Backend> LanguageModel<B> {
             },
         };
 
-        // Voxtral decoder: 32 Q heads / 8 KV heads, head_dim = 96
+        // Voxtral decoder: 32 Q heads / 8 KV heads, head_dim = 128
         let n_kv_heads = 8;
-        let head_dim = d_model / 32; // 3072 / 32 = 96
+        let head_dim = 128;
 
         Self {
             tok_embeddings,
@@ -392,7 +392,7 @@ impl<B: Backend> LanguageModel<B> {
     /// learned parameters and is not serialized.
     pub fn from_parts(parts: DecoderParts<B>, rope: RoPE<B>) -> Self {
         let n_kv_heads = 8;
-        let head_dim = parts.d_model / 32;
+        let head_dim = 128;
         Self {
             tok_embeddings: parts.tok_embeddings,
             rope,
