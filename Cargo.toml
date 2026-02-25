@@ -65,6 +65,7 @@ indicatif = { version = "0.18", optional = true }
 # HuggingFace Hub (optional)
 hf-hub = { version = "0.4", default-features = false, features = ["ureq"], optional = true }
 half = "2.7"
+memmap2 = "0.9"
 
 # NDArray for test data loading (used by test binary too)
 ndarray = "0.16"
