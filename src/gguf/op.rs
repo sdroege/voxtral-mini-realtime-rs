@@ -117,7 +117,10 @@ pub fn q4_matmul<B: Q4Backend>(input: Tensor<B, 3>, weights: &Q4Tensor<B>) -> Te
         n as u32,
         blocks_per_row as u32,
     ];
-    let info_bytes: Vec<u8> = info.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mut info_bytes: [u8; 32] = [0; _];
+    for (idx, b) in info.into_iter().flat_map(|v| v.to_le_bytes()).enumerate() {
+        info_bytes[idx] = b;
+    }
     let info_handle = client.create_from_slice(&info_bytes);
 
     let bindings = Bindings::new()
@@ -132,7 +135,7 @@ pub fn q4_matmul<B: Q4Backend>(input: Tensor<B, 3>, weights: &Q4Tensor<B>) -> Te
     let output_tensor = CubeTensor::new_contiguous(
         client,
         device,
-        burn::prelude::Shape::from(vec![b, m, n]),
+        burn::prelude::Shape::from([b, m, n]),
         output_handle,
         DType::F32,
     );
