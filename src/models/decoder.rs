@@ -3,7 +3,7 @@
 //! Ministral-3B based decoder with GQA and sliding window attention.
 
 use burn::config::Config;
-use burn::module::{Module, Param, ParamId};
+use burn::module::Module;
 use burn::nn::{Embedding, EmbeddingConfig};
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
@@ -178,25 +178,12 @@ impl LanguageModelConfig {
 impl<B: Backend> LanguageModel<B> {
     /// Create language model from components (for weight loading).
     pub fn new(
-        tok_embeddings_weight: Tensor<B, 2>,
+        tok_embeddings: Embedding<B>,
         rope: RoPE<B>,
         layers: Vec<DecoderLayer<B>>,
-        final_norm_weight: Tensor<B, 1>,
-        eps: f64,
+        norm: RmsNorm<B>,
+        d_model: usize,
     ) -> Self {
-        let d_model = tok_embeddings_weight.dims()[1];
-
-        let tok_embeddings = Embedding {
-            weight: Param::initialized(ParamId::new(), tok_embeddings_weight),
-        };
-
-        let norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), final_norm_weight),
-                epsilon: eps,
-            },
-        };
-
         // Voxtral decoder: 32 Q heads / 8 KV heads, head_dim = 128
         let n_kv_heads = 8;
         let head_dim = 128;

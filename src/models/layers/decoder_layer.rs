@@ -3,7 +3,7 @@
 //! GQA attention with sliding window and no biases.
 
 use burn::config::Config;
-use burn::module::{Module, Param, ParamId};
+use burn::module::Module;
 use burn::nn::Linear;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
@@ -106,46 +106,16 @@ impl DecoderLayerConfig {
 
 impl<B: Backend> DecoderLayer<B> {
     /// Create decoder layer from components (for weight loading).
-    ///
-    /// Note: The ada_norm weights are stored differently in SafeTensors:
-    /// - ada_norm_down: [t_cond_dim, d_model] - projects d_model -> t_cond_dim
-    /// - ada_norm_up: [d_model, t_cond_dim] - projects t_cond_dim -> d_model
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        ada_norm_down: Tensor<B, 2>,
-        ada_norm_up: Tensor<B, 2>,
-        attention_norm_weight: Tensor<B, 1>,
+        ada_rms_norm: AdaRmsNorm<B>,
+        attention_norm: RmsNorm<B>,
         attention: Attention<B>,
-        ffn_norm_weight: Tensor<B, 1>,
+        ffn_norm: RmsNorm<B>,
         w1: Linear<B>,
         w2: Linear<B>,
         w3: Linear<B>,
-        _t_cond_dim: usize,
-        eps: f64,
     ) -> Self {
-        use crate::models::weights::linear_from_weights;
-
-        // ADA RMSNorm uses w0 (down) and w2 (up) projections
-        // ada_norm_down: [t_cond_dim, d_model] -> w0 Linear(d_model, t_cond_dim)
-        // ada_norm_up: [d_model, t_cond_dim] -> w2 Linear(t_cond_dim, d_model)
-        let w0 = linear_from_weights(ada_norm_down, None);
-        let ada_w2 = linear_from_weights(ada_norm_up, None);
-        let ada_rms_norm = AdaRmsNorm::new(w0, ada_w2, eps);
-
-        let attention_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), attention_norm_weight),
-                epsilon: eps,
-            },
-        };
-
-        let ffn_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
-                epsilon: eps,
-            },
-        };
-
         let ffn = SwiGLU::new(w1, w2, w3);
 
         Self {

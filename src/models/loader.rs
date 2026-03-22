@@ -6,11 +6,13 @@
 use anyhow::Result;
 use burn::module::{Param, ParamId};
 use burn::nn::conv::Conv1d;
-use burn::nn::Linear;
+use burn::nn::{Embedding, Linear};
 use burn::prelude::Backend;
 use burn::tensor::Tensor;
 use std::path::Path;
 use tracing::info;
+
+use crate::models::layers::{AdaRmsNorm, RmsNorm};
 
 use super::adapter::AudioLanguageAdapter;
 use super::decoder::{LanguageModel, LanguageModelConfig};
@@ -140,6 +142,12 @@ impl VoxtralModelLoader {
         // Load attention norm
         let attention_norm_weight: Tensor<B, 1> =
             load_tensor(&self.safetensors, &names.attention_norm, device)?;
+        let attention_norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), attention_norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
 
         // Load attention weights
         let wq =
@@ -164,6 +172,12 @@ impl VoxtralModelLoader {
         // Load FFN norm
         let ffn_norm_weight: Tensor<B, 1> =
             load_tensor(&self.safetensors, &names.ffn_norm, device)?;
+        let ffn_norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
 
         // Load SwiGLU weights
         let w1 = self.load_linear_without_bias(&names.w1_weight, device)?;
@@ -172,13 +186,12 @@ impl VoxtralModelLoader {
         let w3 = self.load_linear_without_bias(&names.w3_weight, device)?;
 
         Ok(EncoderLayer::new(
-            attention_norm_weight,
+            attention_norm,
             attention,
-            ffn_norm_weight,
+            ffn_norm,
             w1,
             w2,
             w3,
-            config.norm_eps,
         ))
     }
 
@@ -200,12 +213,12 @@ impl VoxtralModelLoader {
         let config = LanguageModelConfig::voxtral();
 
         // Load token embeddings
-        let mut tok_embeddings: Tensor<B, 2> =
+        let mut tok_embeddings_weight: Tensor<B, 2> =
             load_tensor(&self.safetensors, prefixes::TOK_EMBEDDINGS, device)?;
 
         // Truncate vocabulary if requested (saves memory for wasm32)
         if let Some(max_vocab) = max_vocab_size {
-            let [full_vocab, d_model] = tok_embeddings.dims();
+            let [full_vocab, d_model] = tok_embeddings_weight.dims();
             if max_vocab < full_vocab {
                 info!(
                     from = full_vocab,
@@ -213,9 +226,15 @@ impl VoxtralModelLoader {
                     saved_mb = (full_vocab - max_vocab) * d_model / 1_000_000,
                     "Truncating vocabulary"
                 );
-                tok_embeddings = tok_embeddings.slice([0..max_vocab, 0..d_model]);
+                tok_embeddings_weight = tok_embeddings_weight.slice([0..max_vocab, 0..d_model]);
             }
         }
+
+        let d_model = tok_embeddings_weight.dims()[1];
+
+        let tok_embeddings = Embedding {
+            weight: Param::initialized(ParamId::new(), tok_embeddings_weight),
+        };
 
         // Load RoPE (computed, not from weights)
         let rope = RoPEConfig::new(config.head_dim, config.max_seq_len)
@@ -232,13 +251,19 @@ impl VoxtralModelLoader {
         // Load final norm
         let final_norm_weight: Tensor<B, 1> =
             load_tensor(&self.safetensors, prefixes::FINAL_NORM, device)?;
+        let final_norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), final_norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
 
         Ok(LanguageModel::new(
             tok_embeddings,
             rope,
             layers,
-            final_norm_weight,
-            config.norm_eps,
+            final_norm,
+            d_model,
         ))
     }
 
@@ -256,9 +281,22 @@ impl VoxtralModelLoader {
             load_tensor(&self.safetensors, &names.ada_norm_down, device)?;
         let ada_norm_up: Tensor<B, 2> = load_tensor(&self.safetensors, &names.ada_norm_up, device)?;
 
+        // ADA RMSNorm uses w0 (down) and w2 (up) projections
+        // ada_norm_down: [t_cond_dim, d_model] -> w0 Linear(d_model, t_cond_dim)
+        // ada_norm_up: [d_model, t_cond_dim] -> w2 Linear(t_cond_dim, d_model)
+        let w0 = linear_from_weights(ada_norm_down, None);
+        let ada_w2 = linear_from_weights(ada_norm_up, None);
+        let ada_rms_norm = AdaRmsNorm::new(w0, ada_w2, config.norm_eps);
+
         // Load attention norm
         let attention_norm_weight: Tensor<B, 1> =
             load_tensor(&self.safetensors, &names.attention_norm, device)?;
+        let attention_norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), attention_norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
 
         // Load attention weights (no biases in decoder)
         let wq = self.load_linear_without_bias(&names.wq_weight, device)?;
@@ -281,22 +319,26 @@ impl VoxtralModelLoader {
         let ffn_norm_weight: Tensor<B, 1> =
             load_tensor(&self.safetensors, &names.ffn_norm, device)?;
 
+        let ffn_norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
+
         // Load SwiGLU weights (no biases in decoder)
         let w1 = self.load_linear_without_bias(&names.w1_weight, device)?;
         let w2 = self.load_linear_without_bias(&names.w2_weight, device)?;
         let w3 = self.load_linear_without_bias(&names.w3_weight, device)?;
 
         Ok(DecoderLayer::new(
-            ada_norm_down,
-            ada_norm_up,
-            attention_norm_weight,
+            ada_rms_norm,
+            attention_norm,
             attention,
-            ffn_norm_weight,
+            ffn_norm,
             w1,
             w2,
             w3,
-            config.t_cond_dim,
-            config.norm_eps,
         ))
     }
 
@@ -393,7 +435,17 @@ impl VoxtralModelLoader {
 
         let ada_norm_down: Tensor<B, 2> = load_tensor(st, &names.ada_norm_down, device)?;
         let ada_norm_up: Tensor<B, 2> = load_tensor(st, &names.ada_norm_up, device)?;
+        let w0 = linear_from_weights(ada_norm_down, None);
+        let ada_w2 = linear_from_weights(ada_norm_up, None);
+        let ada_rms_norm = AdaRmsNorm::new(w0, ada_w2, config.norm_eps);
+
         let attention_norm_weight: Tensor<B, 1> = load_tensor(st, &names.attention_norm, device)?;
+        let attention_norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), attention_norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
 
         let wq = linear_from_weights(load_tensor(st, &names.wq_weight, device)?, None);
         let wk = linear_from_weights(load_tensor(st, &names.wk_weight, device)?, None);
@@ -412,22 +464,25 @@ impl VoxtralModelLoader {
         );
 
         let ffn_norm_weight: Tensor<B, 1> = load_tensor(st, &names.ffn_norm, device)?;
+        let ffn_norm = RmsNorm {
+            weight: burn::nn::RmsNorm {
+                gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
+                epsilon: config.norm_eps,
+            },
+        };
 
         let w1 = linear_from_weights(load_tensor(st, &names.w1_weight, device)?, None);
         let w2 = linear_from_weights(load_tensor(st, &names.w2_weight, device)?, None);
         let w3 = linear_from_weights(load_tensor(st, &names.w3_weight, device)?, None);
 
         Ok(DecoderLayer::new(
-            ada_norm_down,
-            ada_norm_up,
-            attention_norm_weight,
+            ada_rms_norm,
+            attention_norm,
             attention,
-            ffn_norm_weight,
+            ffn_norm,
             w1,
             w2,
             w3,
-            config.t_cond_dim,
-            config.norm_eps,
         ))
     }
 

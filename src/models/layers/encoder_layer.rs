@@ -7,7 +7,6 @@ use burn::module::Module;
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
 
-use burn::module::{Param, ParamId};
 use burn::nn::Linear;
 
 use super::attention::{Attention, AttentionConfig};
@@ -92,26 +91,13 @@ impl<B: Backend> EncoderLayer<B> {
     /// Create encoder layer from components (for weight loading).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        attention_norm_weight: Tensor<B, 1>,
+        attention_norm: RmsNorm<B>,
         attention: Attention<B>,
-        ffn_norm_weight: Tensor<B, 1>,
+        ffn_norm: RmsNorm<B>,
         w1: Linear<B>,
         w2: Linear<B>,
         w3: Linear<B>,
-        eps: f64,
     ) -> Self {
-        let attention_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), attention_norm_weight),
-                epsilon: eps,
-            },
-        };
-        let ffn_norm = RmsNorm {
-            weight: burn::nn::RmsNorm {
-                gamma: Param::initialized(ParamId::new(), ffn_norm_weight),
-                epsilon: eps,
-            },
-        };
         let ffn = SwiGLU::new(w1, w2, w3);
 
         Self {

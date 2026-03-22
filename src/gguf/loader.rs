@@ -7,68 +7,29 @@
 use anyhow::{bail, Context, Result};
 use burn::module::{Param, ParamId};
 use burn::nn::conv::Conv1d;
+use burn::nn::{Embedding, Linear};
+use burn::prelude::Backend;
 use burn::tensor::{Tensor, TensorData};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek};
 use std::path::Path;
 use tracing::info;
 
+use crate::models::adapter::AudioLanguageAdapter;
 use crate::models::config;
-use crate::models::layers::{ConvDownsampler, RmsNorm, RoPE, RoPEConfig};
+use crate::models::decoder::LanguageModel;
+use crate::models::encoder::AudioEncoder;
+use crate::models::layers::{
+    AdaRmsNorm, Attention, ConvDownsampler, DecoderLayer, EncoderLayer, RmsNorm, RoPEConfig,
+};
+use crate::models::voxtral::VoxtralModel;
 use crate::models::weights::{
     adapter_weight_names, conv_weight_names, decoder_layer_weight_names,
     encoder_layer_weight_names, prefixes,
 };
 
-use super::linear::Q4Linear;
-use super::model::{
-    Q4AdaRmsNorm, Q4Adapter, Q4Attention, Q4AudioEncoder, Q4Backend, Q4DecoderLayer,
-    Q4EncoderLayer, Q4FeedForward, Q4LanguageModel, Q4VoxtralModel,
-};
 use super::reader::{GgmlDtype, GgufReader, ShardedCursor};
 use super::tensor::Q4Tensor;
-
-/// All Q4 model components with token embeddings still in raw Q4 form.
-///
-/// Used by [`Q4ModelLoader::load_deferred`] to allow freeing the GGUF
-/// reader's memory (potentially >2 GB of shard data) before dequantizing
-/// the 131K-vocab embedding table (~1.5 GiB as f32).
-pub struct Q4ModelParts<B: Q4Backend> {
-    pub encoder: Q4AudioEncoder<B>,
-    pub adapter: Q4Adapter<B>,
-    pub decoder_layers: Vec<Q4DecoderLayer<B>>,
-    pub decoder_rope: RoPE<B>,
-    pub decoder_norm: RmsNorm<B>,
-    pub tok_embed_q4_bytes: Vec<u8>,
-    pub tok_embed_shape: [usize; 2],
-}
-
-impl<B: Q4Backend> Q4ModelParts<B> {
-    /// Assemble the final model with Q4 token embeddings.
-    ///
-    /// Keeps embeddings as Q4 on GPU (~216 MB) for the lm_head, with a CPU
-    /// copy for embed_tokens row lookups. This avoids a 1.5 GiB f32 GPU
-    /// buffer that would exceed WebGPU's `maxBufferSize`.
-    pub fn finalize(self, device: &B::Device) -> Result<Q4VoxtralModel<B>> {
-        let [vocab, d_model] = self.tok_embed_shape;
-
-        // Create Q4Tensor on GPU for the lm_head matmul
-        let tok_embed_q4 =
-            Q4Tensor::from_q4_bytes(&self.tok_embed_q4_bytes, [vocab, d_model], device)?;
-
-        let decoder = Q4LanguageModel::new_q4_embeddings(
-            tok_embed_q4,
-            self.tok_embed_q4_bytes,
-            d_model,
-            device.clone(),
-            self.decoder_rope,
-            self.decoder_layers,
-            self.decoder_norm,
-        );
-
-        Ok(Q4VoxtralModel::new(self.encoder, decoder, self.adapter, 4))
-    }
-}
 
 /// Loads a Q4-quantized Voxtral model from a GGUF file.
 pub struct Q4ModelLoader<R: Read + Seek> {
@@ -104,7 +65,7 @@ impl Q4ModelLoader<ShardedCursor> {
 
 impl<R: Read + Seek> Q4ModelLoader<R> {
     /// Load the complete Q4 Voxtral model.
-    pub fn load<B: Q4Backend>(&mut self, device: &B::Device) -> Result<Q4VoxtralModel<B>> {
+    pub fn load<B: Backend>(&mut self, device: &B::Device) -> Result<VoxtralModel<B>> {
         info!(
             version = self.reader.version(),
             tensors = self.reader.tensor_count(),
@@ -122,71 +83,11 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
 
         info!("Q4 model loaded");
 
-        Ok(Q4VoxtralModel::new(encoder, decoder, adapter, 4))
-    }
-
-    /// Load model components without dequantizing token embeddings.
-    ///
-    /// Returns [`Q4ModelParts`] containing all components plus raw Q4 bytes
-    /// for the token embeddings. The caller should drop the loader (freeing
-    /// GGUF shard memory) before calling [`Q4ModelParts::finalize`] to
-    /// dequantize the embeddings.
-    ///
-    /// This two-phase approach keeps peak WASM memory under 4 GB:
-    /// - Phase 1 (loader alive): shards ~2.5 GB + Q4 embed bytes ~216 MB
-    /// - Phase 2 (loader dropped): Q4 embed bytes ~216 MB + f32 embed ~1.5 GiB
-    pub fn load_deferred<B: Q4Backend>(&mut self, device: &B::Device) -> Result<Q4ModelParts<B>> {
-        info!(
-            version = self.reader.version(),
-            tensors = self.reader.tensor_count(),
-            "Loading Q4 Voxtral model from GGUF (deferred embedding)"
-        );
-
-        info!(layers = 32, "Loading audio encoder");
-        let encoder = self.load_encoder(device)?;
-
-        info!("Loading audio-language adapter");
-        let adapter = self.load_adapter(device)?;
-
-        // Extract raw Q4 bytes for token embeddings (don't dequantize yet)
-        let tok_name = prefixes::TOK_EMBEDDINGS;
-        let tok_info = self
-            .reader
-            .tensor_info(tok_name)
-            .with_context(|| format!("Tensor '{tok_name}' not found"))?
-            .clone();
-        let tok_shape = reverse_gguf_dims(tok_info.shape());
-        let tok_embed_q4_bytes = self.reader.tensor_data(tok_name)?;
-
-        info!(layers = 26, "Loading decoder layers");
-        let dec_config = config::LanguageModelConfig::default();
-        let decoder_rope = RoPEConfig::new(dec_config.head_dim, 16384)
-            .with_theta(dec_config.rope_theta)
-            .init(device);
-        let mut decoder_layers = Vec::with_capacity(dec_config.n_layers);
-        for i in 0..dec_config.n_layers {
-            let layer = self
-                .load_decoder_layer(i, &dec_config, device)
-                .with_context(|| format!("Failed to load decoder layer {i}"))?;
-            decoder_layers.push(layer);
-        }
-        let decoder_norm = self.load_rms_norm(prefixes::FINAL_NORM, dec_config.norm_eps, device)?;
-
-        info!("Q4 model loaded (token embeddings deferred)");
-
-        Ok(Q4ModelParts {
-            encoder,
-            adapter,
-            decoder_layers,
-            decoder_rope,
-            decoder_norm,
-            tok_embed_q4_bytes,
-            tok_embed_shape: [tok_shape[0], tok_shape[1]],
-        })
+        Ok(VoxtralModel::new(encoder, decoder, adapter, 4))
     }
 
     /// Load the audio encoder.
-    fn load_encoder<B: Q4Backend>(&mut self, device: &B::Device) -> Result<Q4AudioEncoder<B>> {
+    fn load_encoder<B: Backend>(&mut self, device: &B::Device) -> Result<AudioEncoder<B>> {
         let enc_config = config::AudioEncoderConfig::default();
 
         let conv = self.load_conv_downsampler(device)?;
@@ -206,16 +107,16 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let norm_name = format!("{}.transformer.norm.weight", prefixes::ENCODER);
         let norm = self.load_rms_norm(&norm_name, enc_config.norm_eps, device)?;
 
-        Ok(Q4AudioEncoder::new(conv, rope, layers, norm))
+        Ok(AudioEncoder::new(conv, rope, layers, norm))
     }
 
     /// Load a single encoder layer.
-    fn load_encoder_layer<B: Q4Backend>(
+    fn load_encoder_layer<B: Backend>(
         &mut self,
         layer_idx: usize,
         enc_config: &config::AudioEncoderConfig,
         device: &B::Device,
-    ) -> Result<Q4EncoderLayer<B>> {
+    ) -> Result<EncoderLayer<B>> {
         let names = encoder_layer_weight_names(layer_idx);
 
         let attention_norm =
@@ -229,7 +130,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let wo =
             self.load_q4_linear_with_optional_bias(&names.wo_weight, Some(&names.wo_bias), device)?;
 
-        let attention = Q4Attention::new(
+        let attention = Attention::new(
             wq,
             wk,
             wv,
@@ -247,18 +148,18 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             self.load_q4_linear_with_optional_bias(&names.w2_weight, Some(&names.w2_bias), device)?;
         let w3 = self.load_q4_linear(&names.w3_weight, device)?;
 
-        let ffn = Q4FeedForward::new(w1, w2, w3);
-
-        Ok(Q4EncoderLayer::new(
+        Ok(EncoderLayer::new(
             attention_norm,
             attention,
             ffn_norm,
-            ffn,
+            w1,
+            w2,
+            w3,
         ))
     }
 
     /// Load the conv downsampler (stays f32).
-    fn load_conv_downsampler<B: Q4Backend>(
+    fn load_conv_downsampler<B: Backend>(
         &mut self,
         device: &B::Device,
     ) -> Result<ConvDownsampler<B>> {
@@ -276,11 +177,15 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     }
 
     /// Load the language model decoder.
-    fn load_decoder<B: Q4Backend>(&mut self, device: &B::Device) -> Result<Q4LanguageModel<B>> {
+    fn load_decoder<B: Backend>(&mut self, device: &B::Device) -> Result<LanguageModel<B>> {
         let dec_config = config::LanguageModelConfig::default();
 
         // Token embeddings — Q4_0 in the GGUF, dequantize to f32 for tied lm_head
-        let tok_embeddings = self.load_tok_embeddings(device)?;
+        let tok_embeddings_weight = self.load_tok_embeddings(device)?;
+        let d_model = tok_embeddings_weight.dims()[1];
+        let tok_embeddings = Embedding {
+            weight: Param::initialized(ParamId::new(), tok_embeddings_weight),
+        };
 
         let rope = RoPEConfig::new(dec_config.head_dim, 16384)
             .with_theta(dec_config.rope_theta)
@@ -296,14 +201,20 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
 
         let norm = self.load_rms_norm(prefixes::FINAL_NORM, dec_config.norm_eps, device)?;
 
-        Ok(Q4LanguageModel::new(tok_embeddings, rope, layers, norm))
+        Ok(LanguageModel::new(
+            tok_embeddings,
+            rope,
+            layers,
+            norm,
+            d_model,
+        ))
     }
 
     /// Load token embeddings (Q4_0 → dequantized f32).
     ///
     /// Dequantizes on CPU to avoid a synchronous GPU readback, which panics
     /// on WASM where `block_on()` is unavailable.
-    fn load_tok_embeddings<B: Q4Backend>(&mut self, device: &B::Device) -> Result<Tensor<B, 2>> {
+    fn load_tok_embeddings<B: Backend>(&mut self, device: &B::Device) -> Result<Tensor<B, 2>> {
         let name = prefixes::TOK_EMBEDDINGS;
         let info = self
             .reader
@@ -327,18 +238,18 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     }
 
     /// Load a single decoder layer.
-    fn load_decoder_layer<B: Q4Backend>(
+    fn load_decoder_layer<B: Backend>(
         &mut self,
         layer_idx: usize,
         dec_config: &config::LanguageModelConfig,
         device: &B::Device,
-    ) -> Result<Q4DecoderLayer<B>> {
+    ) -> Result<DecoderLayer<B>> {
         let names = decoder_layer_weight_names(layer_idx);
 
         // ADA RMSNorm conditioning — Q4_0 in GGUF
         let ada_w0 = self.load_q4_linear(&names.ada_norm_down, device)?;
         let ada_w2 = self.load_q4_linear(&names.ada_norm_up, device)?;
-        let ada_rms_norm = Q4AdaRmsNorm::new(ada_w0, ada_w2);
+        let ada_rms_norm = AdaRmsNorm::new(ada_w0, ada_w2, dec_config.norm_eps);
 
         let attention_norm =
             self.load_rms_norm(&names.attention_norm, dec_config.norm_eps, device)?;
@@ -348,7 +259,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let wv = self.load_q4_linear(&names.wv_weight, device)?;
         let wo = self.load_q4_linear(&names.wo_weight, device)?;
 
-        let attention = Q4Attention::new(
+        let attention = Attention::new(
             wq,
             wk,
             wv,
@@ -364,23 +275,24 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let w1 = self.load_q4_linear(&names.w1_weight, device)?;
         let w2 = self.load_q4_linear(&names.w2_weight, device)?;
         let w3 = self.load_q4_linear(&names.w3_weight, device)?;
-        let ffn = Q4FeedForward::new(w1, w2, w3);
 
-        Ok(Q4DecoderLayer::new(
+        Ok(DecoderLayer::new(
             ada_rms_norm,
             attention_norm,
             attention,
             ffn_norm,
-            ffn,
+            w1,
+            w2,
+            w3,
         ))
     }
 
     /// Load the audio-language adapter.
-    fn load_adapter<B: Q4Backend>(&mut self, device: &B::Device) -> Result<Q4Adapter<B>> {
+    fn load_adapter<B: Backend>(&mut self, device: &B::Device) -> Result<AudioLanguageAdapter<B>> {
         let names = adapter_weight_names();
         let linear1 = self.load_q4_linear(&names.linear1_weight, device)?;
         let linear2 = self.load_q4_linear(&names.linear2_weight, device)?;
-        Ok(Q4Adapter::new(linear1, linear2))
+        Ok(AudioLanguageAdapter::new(linear1, linear2))
     }
 
     // -----------------------------------------------------------------------
@@ -388,11 +300,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     // -----------------------------------------------------------------------
 
     /// Load a Q4_0 tensor as a [`Q4Linear`] (no bias).
-    fn load_q4_linear<B: Q4Backend>(
-        &mut self,
-        name: &str,
-        device: &B::Device,
-    ) -> Result<Q4Linear<B>> {
+    fn load_q4_linear<B: Backend>(&mut self, name: &str, device: &B::Device) -> Result<Linear<B>> {
         let info = self
             .reader
             .tensor_info(name)
@@ -406,16 +314,19 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
         let shape = reverse_gguf_dims(info.shape());
         let bytes = self.reader.tensor_data(name)?;
         let q4 = Q4Tensor::from_q4_bytes(&bytes, [shape[0], shape[1]], device)?;
-        Ok(Q4Linear::new(q4, None))
+        Ok(Linear {
+            weight: Param::initialized(ParamId::new(), q4.tensor),
+            bias: None,
+        })
     }
 
     /// Load a Q4_0 tensor with an optional F32 bias as a [`Q4Linear`].
-    fn load_q4_linear_with_optional_bias<B: Q4Backend>(
+    fn load_q4_linear_with_optional_bias<B: Backend>(
         &mut self,
         weight_name: &str,
         bias_name: Option<&str>,
         device: &B::Device,
-    ) -> Result<Q4Linear<B>> {
+    ) -> Result<Linear<B>> {
         let info = self
             .reader
             .tensor_info(weight_name)
@@ -441,11 +352,14 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
             None
         };
 
-        Ok(Q4Linear::new(q4, bias))
+        Ok(Linear {
+            weight: Param::initialized(ParamId::new(), q4.tensor),
+            bias: bias.map(|b| Param::initialized(ParamId::new(), b)),
+        })
     }
 
     /// Load an F32/F16 tensor from GGUF.
-    fn load_f32_tensor<const D: usize, B: Q4Backend>(
+    fn load_f32_tensor<const D: usize, B: Backend>(
         &mut self,
         name: &str,
         device: &B::Device,
@@ -479,7 +393,7 @@ impl<R: Read + Seek> Q4ModelLoader<R> {
     }
 
     /// Load an RmsNorm layer from GGUF.
-    fn load_rms_norm<B: Q4Backend>(
+    fn load_rms_norm<B: Backend>(
         &mut self,
         name: &str,
         eps: f64,
@@ -526,10 +440,7 @@ fn dequantize_q4_0_cpu(raw: &[u8], num_elements: usize) -> Vec<f32> {
 }
 
 /// Create a `Conv1d` from weight tensors (matches existing `loader.rs` helper).
-fn conv1d_from_weights<B: Q4Backend>(
-    weight: Tensor<B, 3>,
-    bias: Option<Tensor<B, 1>>,
-) -> Conv1d<B> {
+fn conv1d_from_weights<B: Backend>(weight: Tensor<B, 3>, bias: Option<Tensor<B, 1>>) -> Conv1d<B> {
     use burn::module::Ignored;
 
     Conv1d {

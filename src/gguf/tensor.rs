@@ -6,27 +6,24 @@
 //! dequantizes on-the-fly inside a fused compute shader.
 
 use anyhow::{ensure, Result};
-use burn::tensor::{Tensor, TensorData};
-use cubecl::client::ComputeClient;
-use cubecl::server::Handle;
-use cubecl::Runtime;
-
-use super::model::Q4Backend;
+use burn::{
+    prelude::Backend,
+    tensor::{Tensor, TensorData},
+};
+use cubecl::quant::scheme::{
+    QuantLevel, QuantMode, QuantParam, QuantScheme, QuantStore, QuantValue,
+};
 
 /// A Q4_0 quantized weight tensor living on GPU.
 ///
 /// The buffer contains raw Q4_0 blocks (18 bytes per block of 32 elements),
 /// laid out exactly as in GGUF. The WGSL shader interprets the buffer as
 /// `array<f16>` with 9 f16 slots per block.
-pub struct Q4Tensor<B: Q4Backend> {
-    pub(crate) handle: Handle,
-    shape: [usize; 2],
-    num_blocks: usize,
-    client: ComputeClient<<B as Q4Backend>::Runtime>,
-    device: B::Device,
+pub struct Q4Tensor<B: Backend> {
+    pub tensor: Tensor<B, 2>,
 }
 
-impl<B: Q4Backend> Q4Tensor<B> {
+impl<B: Backend> Q4Tensor<B> {
     /// Upload raw Q4_0 bytes to a GPU storage buffer.
     ///
     /// Shape is `[N, K]` = `[out_features, in_features]`, matching PyTorch/GGUF
@@ -47,68 +44,63 @@ impl<B: Q4Backend> Q4Tensor<B> {
             raw_bytes.len()
         );
 
-        let client = <<B as Q4Backend>::Runtime as Runtime>::client(device);
+        let scheme = QuantScheme::default()
+            .with_level(QuantLevel::block([32]))
+            .with_mode(QuantMode::Symmetric)
+            .with_value(QuantValue::Q4S)
+            .with_store(QuantStore::PackedU32(0))
+            .with_param(QuantParam::F16);
 
-        // Pad to 4-byte alignment for array<u32> access in the WGSL shader.
-        // Q4_0 blocks are 18 bytes, so total size may not be a multiple of 4.
-        let padded = if !raw_bytes.len().is_multiple_of(4) {
-            let pad = 4 - (raw_bytes.len() % 4);
-            let mut buf = raw_bytes.to_vec();
-            buf.resize(raw_bytes.len() + pad, 0);
-            buf
-        } else {
-            raw_bytes.to_vec()
-        };
-        let handle = client.create_from_slice(&padded);
+        // Convert between GGUF Q4_0 blocks and the format expected by burn.
+        //
+        // GGUF has the scale for each 32 value block in front of each block, burn
+        // has first all values and then all scales. That's the first difference
+        // that needs reorganization.
+        let mut bytes = vec![0u8; (16 + 2) * num_blocks];
+        let (values, scales) = bytes.split_at_mut(16 * num_blocks);
+        for ((values, scales), chunk) in Iterator::zip(
+            Iterator::zip(values.chunks_exact_mut(16), scales.chunks_exact_mut(2)),
+            raw_bytes.chunks_exact(18),
+        ) {
+            scales.copy_from_slice(&chunk[..2]);
+            let chunk = &chunk[2..];
+            for i in 0..8 {
+                // GGUF stores values 0..8 in the lower nibbles and values
+                // 8..16 in the upper nibbles, burn wants them b0 in the low
+                // nibble of byte 0, b1 in the high nibble of the same byte,
+                // etc.
+                let b0 = chunk[i * 2] & 0x0F;
+                let b16 = (chunk[i * 2] >> 4) & 0x0F;
+                let b1 = chunk[i * 2 + 1] & 0x0F;
+                let b17 = (chunk[i * 2 + 1] >> 4) & 0x0F;
 
-        Ok(Self {
-            handle,
-            shape,
-            num_blocks,
-            client,
-            device: device.clone(),
-        })
+                // GGUF uses unsigned integers, burn uses signed integers.
+                let b0 = (b0 as i16 - 8) as u8;
+                let b0 = b0 & 0x0F;
+                let b1 = (b1 as i16 - 8) as u8;
+                let b1 = b1 & 0x0F;
+                let b16 = (b16 as i16 - 8) as u8;
+                let b16 = b16 & 0x0F;
+                let b17 = (b17 as i16 - 8) as u8;
+
+                values[i + 0] = (b1 << 4) | b0;
+                values[i + 8] = (b17 << 4) | b16;
+            }
+        }
+
+        let data = TensorData::from_bytes_vec(bytes, [k * n], burn::tensor::DType::QFloat(scheme));
+        let tensor = Tensor::<B, 1>::from_data(data, device);
+        // FIXME: Dequantization needed because of https://github.com/tracel-ai/burn/issues/4659
+        let tensor = tensor.dequantize().reshape(shape).transpose();
+        Ok(Self { tensor })
     }
 
     /// Logical weight dimensions `[N, K]` = `[out_features, in_features]`.
     pub fn shape(&self) -> [usize; 2] {
-        self.shape
+        [self.tensor.shape().dims[0], self.tensor.shape().dims[1]]
     }
 
-    /// Number of Q4_0 blocks in the tensor.
-    pub fn num_blocks(&self) -> usize {
-        self.num_blocks
-    }
-
-    /// Dequantize the Q4_0 data to a full-precision `Tensor<_, 2>`.
-    ///
-    /// This reads the raw bytes back from GPU and dequantizes on CPU.
-    /// Intended for diagnostics and testing — the hot path uses
-    /// [`q4_matmul`](super::op::q4_matmul) which dequantizes on GPU.
     pub fn dequantize(&self) -> Tensor<B, 2> {
-        let bytes = self.client.read_one(self.handle.clone());
-        let raw: &[u8] = &bytes;
-
-        let [n, k] = self.shape;
-        let num_elements = n * k;
-        let mut output = vec![0.0f32; num_elements];
-
-        for block_idx in 0..self.num_blocks {
-            let offset = block_idx * 18;
-            let d_bits = u16::from_le_bytes([raw[offset], raw[offset + 1]]);
-            let d = half::f16::from_bits(d_bits).to_f32();
-
-            let base = block_idx * 32;
-            for i in 0..16 {
-                let byte = raw[offset + 2 + i];
-                let lo = (byte & 0x0F) as f32 - 8.0;
-                let hi = ((byte >> 4) & 0x0F) as f32 - 8.0;
-                output[base + i] = lo * d;
-                output[base + i + 16] = hi * d;
-            }
-        }
-
-        let tensor_data = TensorData::new(output, [n, k]);
-        Tensor::from_data(tensor_data, &self.device)
+        self.tensor.clone().dequantize()
     }
 }
